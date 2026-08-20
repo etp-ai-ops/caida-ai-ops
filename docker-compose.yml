@@ -21,6 +21,17 @@ services:
       - "127.0.0.1:${MCP_PORT:-8000}:${MCP_PORT:-8000}"
     volumes:
       - itdk-outputs:/app/outputs
+      # Live Ark measurement talks to a unix socket that exists only on an Ark
+      # host; it cannot be reached over the network, so the container must run
+      # on one and bind-mount it. Omit this and the Ark tools fail with an
+      # explicit "no Ark mux socket" error while the ITDK tools keep working.
+      - ${ARK_MUX_SOCKET:-/run/ark/mux}:/run/ark/mux
+    # The socket is mode 660 owned by group ark-mux, and GIDs -- not group
+    # names -- are what cross the container boundary. The GID is assigned per
+    # host, so read it on the host you are deploying to rather than assuming a
+    # value:  getent group ark-mux | cut -d: -f3
+    group_add:
+      - "${ARK_MUX_GID:?set ARK_MUX_GID, e.g. export ARK_MUX_GID=$(getent group ark-mux | cut -d: -f3)}"
     healthcheck:
       test:
         - CMD

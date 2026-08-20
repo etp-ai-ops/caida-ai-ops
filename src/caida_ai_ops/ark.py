@@ -48,6 +48,7 @@ import argparse
 import ipaddress
 import json
 import os
+import stat
 import statistics
 import uuid
 from collections.abc import Callable
@@ -319,6 +320,54 @@ def _demo_warning() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _check_mux_access(mux_path: Path) -> None:
+    """Fail with the actual reason the Ark mux cannot be used.
+
+    Three distinct causes get conflated into one unhelpful message otherwise,
+    and they need three different fixes:
+
+    - the socket is absent (running off an Ark host, or the container did not
+      bind-mount it),
+    - it exists but is not a socket (a stale file, or a directory created by a
+      bind-mount of a path that did not exist on the host),
+    - it exists but the process cannot open it (not in the ``ark-mux`` group,
+      or the container was not given that GID).
+
+    Telling them apart is the difference between a five-second fix and an hour.
+    """
+    if not mux_path.exists():
+        raise ArkMuxUnavailableError(
+            f"no Ark mux socket at {mux_path}. Live measurement needs the socket the "
+            f"ark-mux daemon listens on, which exists only on an Ark host -- it cannot "
+            f"be reached over the network. In a container, bind-mount it "
+            f"(-v {mux_path}:{mux_path}). Elsewhere, set MATTHEWPP_MUX to its real path, "
+            f"or MATTHEWPP_DEMO=1 to use synthetic fixtures."
+        )
+    if not stat.S_ISSOCK(mux_path.stat().st_mode):
+        raise ArkMuxUnavailableError(
+            f"{mux_path} exists but is not a unix socket. A container bind-mount of a "
+            f"path that does not exist on the host silently creates a directory here; "
+            f"check the host path before mounting."
+        )
+    if not os.access(mux_path, os.R_OK | os.W_OK):
+        gid = mux_path.stat().st_gid
+        try:
+            import grp
+            group = grp.getgrgid(gid).gr_name
+        except (KeyError, ImportError):
+            group = "ark-mux"
+        raise ArkMuxUnavailableError(
+            f"permission denied opening {mux_path}. The socket is mode "
+            f"{oct(mux_path.stat().st_mode & 0o777)} owned by group {group!r} (gid {gid}), "
+            f"and this process (uid {os.getuid()}, groups {sorted(os.getgroups())}) is not "
+            f"in it. On a host: have an administrator add your user to {group!r} (CAIDA "
+            f"access requires signing the Computer Facilities Usage Agreement). In a "
+            f"container: pass the host's numeric gid, e.g. group_add: [\"{gid}\"] -- GIDs "
+            f"are numeric across the container boundary and are assigned per host, so read "
+            f"it with `getent group {group}` on the host rather than assuming a value."
+        )
+
+
 def _get_scamper_ctrl():
     """Return a live ``ScamperCtrl`` instance, or raise.
 
@@ -329,15 +378,23 @@ def _get_scamper_ctrl():
         from scamper import ScamperCtrl  # type: ignore  # CAIDA-internal package
     except ImportError as exc:
         raise ArkMuxUnavailableError(
-            "the 'scamper' package (ScamperCtrl) is not installed in this environment. "
-            "Set MATTHEWPP_DEMO=1 to exercise this function against synthetic fixtures, "
-            "or run inside CAIDA's Ark-enabled environment (see "
-            "etp-2026-overview/scamper-orientation.md for access)."
+            "the 'scamper' Python module is not importable. It is not on PyPI: it ships "
+            "as CAIDA's python3-scamper package, a compiled C extension tied to one "
+            "Python minor version, so pip cannot supply it and a plain venv hides it. "
+            "Install it from https://pkg.ark.caida.org/ubuntu for this host's release "
+            "and create the venv with --system-site-packages. "
+            "Set MATTHEWPP_DEMO=1 to work against synthetic fixtures instead."
         ) from exc
+
+    mux_path = Path(os.environ.get("MATTHEWPP_MUX", "/run/ark/mux"))
+    _check_mux_access(mux_path)
     try:
-        return ScamperCtrl(mux=os.environ.get("MATTHEWPP_MUX", "/run/ark/mux"))
+        return ScamperCtrl(mux=str(mux_path))
     except Exception as exc:  # noqa: BLE001
-        raise ArkMuxUnavailableError(f"could not connect to the Ark mux socket: {exc}") from exc
+        raise ArkMuxUnavailableError(
+            f"the Ark mux socket at {mux_path} exists and is accessible, but the "
+            f"connection failed: {exc}. The ark-mux daemon may not be running."
+        ) from exc
 
 
 def _dispatch(fn: Callable[[Any], Any], items: list, parallel: bool, max_workers: int = 16) -> list:

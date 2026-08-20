@@ -54,3 +54,19 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build --tag caida-ai-ops:ci .
+      # The image previously built and passed every test while being incapable
+      # of live Ark measurement: python3-scamper was never installed, and demo
+      # mode needs none of it. Assert the capability directly, in the image, so
+      # that failure can never again be invisible to CI.
+      - name: scamper is importable inside the image
+        run: docker run --rm caida-ai-ops:ci python -c "import scamper; print(scamper.__file__)"
+      - name: Ark tools report a clear error without the mux socket
+        run: |
+          docker run --rm caida-ai-ops:ci python -c "
+          from caida_ai_ops import ark
+          r = ark.list_vps()
+          assert r['status'] == 'error', r
+          msg = r['error']['message']
+          assert 'no Ark mux socket' in msg, msg
+          print('degrades correctly:', msg[:70])
+          "

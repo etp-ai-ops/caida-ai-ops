@@ -3,6 +3,10 @@ notebook, MCP client) depends on being stable."""
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 ENVELOPE_KEYS = {"status", "function", "parameters", "data", "warnings", "provenance"}
 
 
@@ -118,3 +122,59 @@ def test_discovery_failure_surfaces_its_real_reason(am, monkeypatch):
     r = am.ping(target="x", vp_filter={"country": "ZZ"}, count=1)
     assert r["status"] == "error"
     assert "no active Ark VPs matched" in r["error"]["message"]
+
+
+# --- Ark mux availability --------------------------------------------------
+
+
+def test_missing_mux_socket_says_so_and_how_to_fix_it(am, tmp_path):
+    """Three causes get conflated into one unhelpful message otherwise, and
+    they need three different fixes. Absent socket = not on an Ark host, or the
+    container did not bind-mount it."""
+    with pytest.raises(am.ArkMuxUnavailableError) as exc:
+        am._check_mux_access(tmp_path / "nope")
+    msg = str(exc.value)
+    assert "no Ark mux socket" in msg
+    assert "bind-mount" in msg and "MATTHEWPP_DEMO" in msg
+
+
+def test_non_socket_path_is_reported_distinctly(am, tmp_path):
+    """A container bind-mount of a host path that does not exist silently
+    creates a directory — a confusing failure worth naming exactly."""
+    stray = tmp_path / "mux"
+    stray.mkdir()
+    with pytest.raises(am.ArkMuxUnavailableError, match="not a unix socket"):
+        am._check_mux_access(stray)
+
+
+def test_unreadable_socket_names_the_group_and_gid(am, tmp_path):
+    """Not being in ark-mux is the most common live failure. The message must
+    carry the numeric gid, since that is what crosses a container boundary."""
+    import socket as _socket
+
+    sock_path = tmp_path / "mux"
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        srv.bind(str(sock_path))
+        sock_path.chmod(0o000)
+        if os.access(sock_path, os.R_OK | os.W_OK):
+            pytest.skip("running as root: permission checks do not apply")
+        with pytest.raises(am.ArkMuxUnavailableError) as exc:
+            am._check_mux_access(sock_path)
+        msg = str(exc.value)
+        assert "permission denied" in msg
+        assert "group_add" in msg and "getent group" in msg
+    finally:
+        srv.close()
+
+
+def test_accessible_socket_passes(am, tmp_path):
+    import socket as _socket
+
+    sock_path = tmp_path / "mux"
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        srv.bind(str(sock_path))
+        am._check_mux_access(sock_path)  # must not raise
+    finally:
+        srv.close()
