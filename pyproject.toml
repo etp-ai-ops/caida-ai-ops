@@ -35,6 +35,7 @@ notebooks = ["jupyter>=1.1,<2"]
 [project.scripts]
 caida-ai-ops = "caida_ai_ops.server:main"
 caida-itdk-service = "caida_ai_ops.itdk.__main__:main"
+caida-itdk-mcp = "caida_ai_ops.itdk_mcp:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/caida_ai_ops"]
