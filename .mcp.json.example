@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "itdk": {
+      "command": "uvx",
+      "args": [
+        "--python", "3.12",
+        "--from", "git+ssh://git@github.com/etp-ai-ops/caida-ai-ops.git",
+        "caida-itdk-mcp"
+      ],
+      "env": {}
+    }
+  }
+}
