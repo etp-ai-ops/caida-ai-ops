@@ -1,0 +1,41 @@
+services:
+  caida-ai-ops:
+    build:
+      context: .
+    environment:
+      MCP_MASTER_KEY: "${MCP_MASTER_KEY:?MCP_MASTER_KEY must be set}"
+      DATABASE_URL: "${DATABASE_URL:-}"
+      DB_HOST: "${DB_HOST:-}"
+      DB_PORT: "${DB_PORT:-}"
+      DB_NAME: "${DB_NAME:-}"
+      DB_USERNAME: "${DB_USERNAME:-}"
+      DB_PASSWORD: "${DB_PASSWORD:-}"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "${MCP_PORT:-8000}"
+      DB_POOL_MAX: "${DB_POOL_MAX:-5}"
+      QUERY_TIMEOUT_MS: "${QUERY_TIMEOUT_MS:-30000}"
+      OUTPUT_DIR: "/app/outputs"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    init: true
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:${MCP_PORT:-8000}"
+    volumes:
+      - itdk-outputs:/app/outputs
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:${MCP_PORT:-8000}/healthz', timeout=2)
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  itdk-outputs:
+    name: caida-ai-ops-outputs

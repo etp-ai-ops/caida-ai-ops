@@ -1,0 +1,25 @@
+# ITDK MCP Documentation
+
+This directory is the project’s second brain: durable context that helps a
+new contributor understand why the server exists, how it is constrained, and
+what remains to be done. Keep documents short, linked, and current; promote
+important discoveries out of chat, issues, and code into the appropriate area.
+
+## Start here
+
+- [Plans](plans/README.md) — sequenced implementation work and its status.
+- [Architecture](architecture/README.md) — system boundaries and technical
+  design.
+- [Contracts](contracts/README.md) — MCP tool and data-return contracts.
+- [Data](data/README.md) — supplied database schema, query access patterns,
+  and data constraints.
+- [Operations](operations/README.md) — configuration, Docker, deployment, and
+  incident-facing guidance.
+- [Decisions](decisions/README.md) — concise records of consequential choices.
+
+## Documentation conventions
+
+- Plans are dated and actionable. Update their status as work is completed.
+- Contract changes require corresponding implementation and test updates.
+- Never copy secrets, connection strings, or values from `.env` into docs.
+- Prefer links to a canonical document over duplicating its content.
