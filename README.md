@@ -8,7 +8,9 @@ repositories.
 ## Capabilities
 
 - **Ark:** discover vantage points; run bounded ping, traceroute, and DNS measurements;
-  compare paths; and diagnose multi-vantage-point anomalies.
+  compare paths; diagnose multi-vantage-point anomalies; and enrich hops with sourced IP
+  metadata. Enrichment flags location claims that are physically incompatible with observed
+  RTT instead of silently trusting them.
 - **AS Rank:** inspect customer cones, tier distributions, organizations, and countries.
 - **ITDK analyses:** run the original geo-adjacency, footprint, peering, and pairwise-link
   analyses with a consistent JSON envelope.
@@ -34,6 +36,16 @@ MATTHEWPP_DEMO=1 caida-ai-ops
 Generic ITDK tools load their database connection lazily. Configure `DATABASE_URL`, or all
 five of `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, and `DB_PASSWORD`, before calling one
 of those tools. They write results beneath `OUTPUT_DIR` (default `/app/outputs`).
+
+On hosts without CAIDA's `/data` mount, build the public RFC 8805 geofeed cache once before
+using city lookup or hop enrichment:
+
+```bash
+python -m caida_ai_ops.geodata build-geofeed-cache
+```
+
+The compact index is stored under `MATTHEWPP_GEODATA_DIR`, or the service's
+`OUTPUT_DIR/geodata` directory.
 
 For the authenticated HTTP service, also set a visible-ASCII `MCP_MASTER_KEY` of at least 32
 characters and run:

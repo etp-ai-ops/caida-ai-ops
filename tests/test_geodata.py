@@ -123,3 +123,90 @@ def test_unmatched_hostname_returns_none_rather_than_guessing(fake_hoiho):
 def test_hostname_matching_is_domain_anchored(fake_hoiho):
     """`evil-example.net` must not match rules learned for `example.net`."""
     assert g.city_from_hostname("xe-0-0-0.lax-agg1.evil-example.net") is None
+
+
+# --- RTT plausibility ------------------------------------------------------
+
+
+def test_speed_of_light_floor():
+    """Sanity-check the physics: ~180 km round trip in fibre is ~1.8 ms."""
+    assert 1.7 < g.min_rtt_ms_for_km(180) < 1.9
+    assert 88 < g.min_rtt_ms_for_km(9000) < 95
+
+
+def test_impossible_claim_is_refuted():
+    """A hop 3 ms from San Diego cannot be in Tokyo, whatever a dataset says.
+    This is the only check in the stack that can *disagree* with a claim."""
+    out = g.rtt_consistency(32.72, -117.16, 35.69, 139.69, rtt_ms=3.0)
+    assert out["consistent"] is False
+    assert out["min_possible_ms"] > 90
+
+
+def test_plausible_claim_is_not_refuted():
+    out = g.rtt_consistency(32.72, -117.16, 33.94, -118.41, rtt_ms=3.0)
+    assert out["consistent"] is True
+    assert out["distance_km"] < 200
+
+
+def test_check_only_refutes_it_never_confirms():
+    """3 ms from San Diego is equally consistent with LA and with San Diego
+    itself — consistent:True means 'not excluded', not 'verified'."""
+    la = g.rtt_consistency(32.72, -117.16, 33.94, -118.41, rtt_ms=3.0)
+    sd = g.rtt_consistency(32.72, -117.16, 32.72, -117.16, rtt_ms=3.0)
+    assert la["consistent"] and sd["consistent"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (None, -117.16, 33.94, -118.41, 3.0),  # unknown VP location
+        (32.72, -117.16, None, None, 3.0),  # unknown claim location
+        (32.72, -117.16, 33.94, -118.41, None),  # no reply to time
+        (32.72, -117.16, 33.94, -118.41, 0),
+    ],
+)
+def test_uncheckable_returns_none_not_a_verdict(args):
+    """Missing inputs must not silently become 'consistent'."""
+    assert g.rtt_consistency(*args) is None
+
+
+def test_cached_geofeeds_are_used_without_caida_mount(tmp_path, monkeypatch):
+    import gzip
+    import json
+
+    monkeypatch.setenv("MATTHEWPP_GEODATA_DIR", str(tmp_path))
+    cache_path = tmp_path / "geofeeds-index.jsonl.gz"
+    with gzip.open(cache_path, "wt") as destination:
+        destination.write(json.dumps(["203.0.113.0/24", "US", "CA", "San Diego"]) + "\n")
+    monkeypatch.setattr(g, "_latest_local_geofeed_day", lambda: None)
+    g._cache.pop("geofeeds", None)
+
+    index, reverse, source = g.load_geofeeds()
+
+    assert index.lookup("203.0.113.1")["city"] == "San Diego"
+    assert reverse["san diego, us"] == ["203.0.113.0/24"]
+    assert source["origin"] == "cache:public-mirror"
+
+
+def test_hop_geo_claim_is_demoted_when_rtt_refutes_it(monkeypatch):
+    from caida_ai_ops import ark
+
+    monkeypatch.setattr(ark, "address_scope", lambda ip: None)
+    monkeypatch.setattr(ark, "asn_for_ip", lambda ip: 64500)
+    monkeypatch.setattr(
+        ark,
+        "city_from_hostname",
+        lambda hostname: {
+            "city": "Tokyo",
+            "country": "JP",
+            "lat": 35.69,
+            "lng": 139.69,
+        },
+    )
+    annotated = ark._annotate_hop(
+        {"ip": "8.8.8.8", "hostname": "router.example", "rtt_ms": 3.0},
+        {"lat": 32.72, "lon": -117.16},
+    )
+
+    assert annotated["geo"]["rtt_check"]["consistent"] is False
+    assert annotated["geo"]["confidence"] == "contradicted-by-rtt"

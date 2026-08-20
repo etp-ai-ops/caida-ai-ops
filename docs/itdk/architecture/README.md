@@ -23,3 +23,10 @@ emitting results are archived beneath `MATTHEWPP_RESULTS_DIR`, or `OUTPUT_DIR/ar
 in a service deployment. Live Ark also requires the host's scamper Python package, mux
 socket mount, and matching group permissions; the standard image is suitable for demo and
 database workloads unless those host integrations are supplied.
+
+Traceroute archives include the measuring VP's coordinates. During enrichment, hop location
+claims are checked against the fastest possible round trip through fibre. Physically
+impossible claims remain visible but are demoted to `confidence: contradicted-by-rtt` with an
+`rtt_check` evidence object. A positive consistency result means only “not excluded.” Hosts
+without `/data/external/geofeed-whois` can build a compact public-mirror index with
+`python -m caida_ai_ops.geodata build-geofeed-cache`.

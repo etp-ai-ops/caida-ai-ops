@@ -87,6 +87,18 @@ def test_dns_target_is_captured_from_qname(am, store):
     assert _index(store)[0]["targets"] == ["example.com"]
 
 
+def test_traceroute_archives_vp_locations_for_later_rtt_checks(am, store):
+    result = am.traceroute(target="example.com", vp_filter={"region": "east-asia"})
+
+    locations = result["data"]["vp_locations"]
+    assert locations
+    assert all(location["lat"] is not None and location["lon"] is not None for location in locations.values())
+
+    result_id = am.list_results(function="traceroute")["data"][0]["result_id"]
+    archived = am.get_result(result_id)["data"]
+    assert archived["data"]["vp_locations"] == locations
+
+
 def test_records_are_schema_versioned(am, store):
     r = am.ping(target="a.example", vp_filter={"region": "africa"}, count=2)
     assert json.loads(open(r["provenance"]["result_path"]).read())["schema_version"] == 1

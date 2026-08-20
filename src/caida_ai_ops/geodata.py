@@ -74,16 +74,12 @@ class GeoDataUnavailableError(MatthewPPError):
 
 
 def geodata_dir() -> Path:
-    return Path(
-        os.environ.get(
-            "MATTHEWPP_GEODATA_DIR",
-            str(
-                Path(os.environ["OUTPUT_DIR"]) / "geodata"
-                if os.environ.get("OUTPUT_DIR")
-                else Path.home() / ".caida-ai-ops" / "geodata"
-            ),
-        )
-    ).expanduser()
+    default = (
+        Path(os.environ["OUTPUT_DIR"]) / "geodata"
+        if os.environ.get("OUTPUT_DIR")
+        else Path.home() / ".caida-ai-ops" / "geodata"
+    )
+    return Path(os.environ.get("MATTHEWPP_GEODATA_DIR", str(default))).expanduser()
 
 
 def _cached(name: str, url: str, max_age_s: int = CACHE_MAX_AGE_S) -> Path:
@@ -217,12 +213,26 @@ def load_geofeeds() -> tuple[PrefixIndex, dict[str, list[str]], dict]:
         return _cache["geofeeds"]  # type: ignore[return-value]
     day = _latest_local_geofeed_day()
     if day is None:
-        raise GeoDataUnavailableError(
-            "geofeed data not found under /data/external/geofeed-whois, and the public "
-            "mirror publishes ~5700 individual CSVs which are impractical to fetch on "
-            "demand. Run on a host with the CAIDA data mount, or pre-populate "
-            f"{geodata_dir() / 'geofeeds'} from {PUBLIC_BASE}/geofeed-whois/."
-        )
+        # No CAIDA mount: fall back to the compact index built by
+        # `build_geofeed_cache()` from the public mirror.
+        rows = _load_geofeed_cache()
+        if rows is None:
+            raise GeoDataUnavailableError(
+                "geofeed data is not available. There is no CAIDA mount at "
+                "/data/external/geofeed-whois, and no cached index at "
+                f"{_geofeed_cache_path()}. Build one once with "
+                "`python -m caida_ai_ops.geodata build-geofeed-cache` (downloads ~5700 small "
+                "files from publicdata.caida.org; a few minutes, then cached)."
+            )
+        idx = PrefixIndex()
+        reverse = {}
+        for prefix, cc, region, city in rows:
+            loc = {"city": city, "region": region, "country": cc, "prefix": prefix}
+            idx.add(prefix, loc)
+            reverse.setdefault(f"{city.lower()}, {cc.lower()}", []).append(prefix)
+        out = (idx, reverse, {"origin": "cache:public-mirror", "path": str(_geofeed_cache_path())})
+        _cache["geofeeds"] = out
+        return out
     idx = PrefixIndex()
     reverse: dict[str, list[str]] = {}
     for csv_path in day.glob("registries/*/*/*.csv"):
@@ -281,11 +291,17 @@ def load_hoiho() -> tuple[list[dict], dict]:
             for hint in entry.get("geohints", []):
                 loc = hint.get("location") or {}
                 if hint.get("code") and loc.get("place"):
+                    try:
+                        lat, lng = float(hint["lat"]), float(hint["lng"])
+                    except (KeyError, TypeError, ValueError):
+                        lat = lng = None
                     hints[hint["code"].lower()] = {
                         "city": loc.get("place"),
                         "region": loc.get("st"),
                         "country": loc.get("cc"),
                         "code_type": hint.get("type"),
+                        "lat": lat,
+                        "lng": lng,
                     }
             if not hints:
                 continue
@@ -447,3 +463,188 @@ def source_versions() -> dict:
         except (GeoDataUnavailableError, OSError) as exc:
             versions[key] = {"unavailable": str(exc)[:160]}
     return versions
+
+
+# --- distance / physics ----------------------------------------------------
+
+# Light in fibre travels at roughly two-thirds of c. A round trip over a given
+# distance therefore has a hard minimum RTT that nothing can beat -- no routing,
+# no hardware. That makes RTT the only source here capable of *refuting* a
+# location claim: every other dataset can only assert one.
+C_FIBRE_KM_PER_S = 3e5 * 0.66
+
+# Real paths are not great circles and queueing inflates RTT, so the bound is
+# only ever used to reject claims that are physically impossible, never to
+# confirm one. A small tolerance absorbs clock and measurement noise.
+RTT_TOLERANCE = 0.90
+
+
+def min_rtt_ms_for_km(km: float) -> float:
+    """Fastest possible round trip over a great-circle distance, in ms."""
+    return (2.0 * km) / C_FIBRE_KM_PER_S * 1000.0
+
+
+def city_coordinates(city: str, country: str | None = None) -> tuple[float, float] | None:
+    """Coordinates for a city, from the geohints inside CAIDA's hoiho rules.
+
+    Not a general gazetteer -- it covers the cities that appear in operator
+    router names, which is exactly the population that shows up in traceroute
+    hops, and it costs nothing extra since the file is already loaded.
+    """
+    if "hoiho_gazetteer" not in _cache:
+        rules, _ = load_hoiho()
+        gaz: dict[tuple[str, str], tuple[float, float]] = {}
+        for rule in rules:
+            for hint in rule["hints"].values():
+                if hint.get("lat") is None or not hint.get("city"):
+                    continue
+                key = (hint["city"].lower(), (hint.get("country") or "").lower())
+                gaz.setdefault(key, (hint["lat"], hint["lng"]))
+        _cache["hoiho_gazetteer"] = gaz
+    gaz = _cache["hoiho_gazetteer"]  # type: ignore[assignment]
+    city_l = city.strip().lower()
+    if country:
+        hit = gaz.get((city_l, country.strip().lower()))
+        if hit:
+            return hit
+    for (name, _cc), coords in gaz.items():
+        if name == city_l:
+            return coords
+    return None
+
+
+def rtt_consistency(
+    vp_lat: float | None,
+    vp_lon: float | None,
+    claim_lat: float | None,
+    claim_lon: float | None,
+    rtt_ms: float | None,
+) -> dict | None:
+    """Is a location claim physically reachable in the RTT observed?
+
+    Returns ``{"consistent": bool, "min_possible_ms", "observed_ms",
+    "distance_km"}``, or None when the check cannot be made (unknown
+    coordinates, or no reply to time).
+
+    ``consistent: False`` means the claim is *impossible* -- the packet would
+    have had to outrun light. ``consistent: True`` means only that the claim is
+    not excluded: an RTT of 3 ms from San Diego is equally consistent with Los
+    Angeles, Orange County, and San Diego itself.
+    """
+    if None in (vp_lat, vp_lon, claim_lat, claim_lon, rtt_ms) or rtt_ms <= 0:
+        return None
+    from .core import haversine_km
+
+    km = haversine_km(vp_lat, vp_lon, claim_lat, claim_lon)
+    floor = min_rtt_ms_for_km(km)
+    return {
+        "consistent": rtt_ms >= floor * RTT_TOLERANCE,
+        "min_possible_ms": round(floor, 2),
+        "observed_ms": round(rtt_ms, 2),
+        "distance_km": round(km, 1),
+    }
+
+
+# --- geofeed cache for hosts without the CAIDA mount -----------------------
+#
+# The public mirror publishes each operator's geofeed as its own small CSV --
+# roughly 5700 of them. Fetching those per query would be absurd, so they are
+# downloaded once, parsed, and written out as a single compact index. After
+# that a machine with only mux access behaves exactly like an Ark host.
+
+
+def _geofeed_cache_path() -> Path:
+    return geodata_dir() / "geofeeds-index.jsonl.gz"
+
+
+def _load_geofeed_cache() -> list[tuple[str, str, str, str]] | None:
+    path = _geofeed_cache_path()
+    if not path.exists():
+        return None
+    rows = []
+    with gzip.open(path, "rt") as fh:
+        for line in fh:
+            try:
+                rows.append(tuple(json.loads(line)))  # type: ignore[arg-type]
+            except json.JSONDecodeError:
+                continue
+    return rows or None
+
+
+def _public_geofeed_day() -> str:
+    """Most recent day directory on the public mirror, as YYYY/MM/DD."""
+
+    def _links(url: str, pattern: str) -> list[str]:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        return sorted(set(re.findall(pattern, body)))
+
+    base = f"{PUBLIC_BASE}/geofeed-whois/"
+    year = _links(base, r'href="(\d{4})/"')[-1]
+    month = _links(f"{base}{year}/", r'href="(\d{2})/"')[-1]
+    day = _links(f"{base}{year}/{month}/", r'href="(\d{2})/"')[-1]
+    return f"{year}/{month}/{day}"
+
+
+def build_geofeed_cache(max_workers: int = 16, progress: bool = True) -> dict:
+    """Download the public geofeed corpus once and write a compact local index.
+
+    Only needed on hosts without /data. Returns a summary dict.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    day = _public_geofeed_day()
+    root = f"{PUBLIC_BASE}/geofeed-whois/{day}/registries"
+    urls: list[str] = []
+    with urllib.request.urlopen(root + "/", timeout=60) as resp:
+        registries = sorted(set(re.findall(r'href="([a-z]+)/"', resp.read().decode("utf-8", "replace"))))
+    for registry in registries:
+        for kind in ("standard", "non_standard"):
+            listing = f"{root}/{registry}/{kind}/"
+            try:
+                with urllib.request.urlopen(listing, timeout=60) as resp:
+                    body = resp.read().decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001 - a registry may publish neither kind
+                continue
+            urls += [listing + name for name in sorted(set(re.findall(r'href="([^"/]+\.csv)"', body)))]
+
+    def fetch(url: str) -> list[tuple[str, str, str, str]]:
+        try:
+            with urllib.request.urlopen(url, timeout=45) as resp:
+                text = resp.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - one operator's server being down is normal
+            return []
+        found = []
+        for row in csv.reader(line.replace("\0", "") for line in text.splitlines()):
+            if len(row) < 4 or not row[0] or row[0].lstrip().startswith("#"):
+                continue
+            prefix, cc, region, city = (row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip())
+            if city and _plausible_geofeed_prefix(prefix):
+                found.append((prefix, cc, region, city))
+        return found
+
+    rows: list[tuple[str, str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for i, chunk in enumerate(pool.map(fetch, urls)):
+            rows.extend(chunk)
+            if progress and i % 500 == 0:
+                print(f"  {i}/{len(urls)} files, {len(rows)} prefixes", flush=True)
+
+    path = _geofeed_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".part")
+    with gzip.open(tmp, "wt") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
+    tmp.replace(path)
+    _cache.pop("geofeeds", None)
+    return {"day": day, "files": len(urls), "prefixes": len(rows), "path": str(path)}
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "build-geofeed-cache":
+        print(json.dumps(build_geofeed_cache(), indent=2))
+    else:
+        print(json.dumps(source_versions(), indent=2, default=str))

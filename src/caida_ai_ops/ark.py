@@ -71,10 +71,12 @@ from .geodata import (
     GeoDataUnavailableError,
     address_scope,
     asn_for_ip,
+    city_coordinates,
     city_from_hostname,
     country_for_ip,
     geofeed_for_ip,
     prefixes_in_city,
+    rtt_consistency,
     source_versions,
 )
 
@@ -1211,11 +1213,26 @@ def traceroute(
         )
 
     run_id = f"tr_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    # Keep archived runs self-contained so later enrichment can check a
+    # location claim without reconnecting to the mux or assuming the VP still
+    # exists at the same location.
+    vp_locations = {vp["vp_id"]: {"lat": vp.get("lat"), "lon": vp.get("lon")} for vp in vps}
     store = _load_run_store()
-    store["runs"][run_id] = {"run_id": run_id, "target": target, "timestamp_utc": now_iso(), "traces": traces}
+    store["runs"][run_id] = {
+        "run_id": run_id,
+        "target": target,
+        "timestamp_utc": now_iso(),
+        "traces": traces,
+        "vp_locations": vp_locations,
+    }
     _save_run_store(store)
 
-    data = {"run_id": run_id, "target": target, "traces": traces}
+    data = {
+        "run_id": run_id,
+        "target": target,
+        "traces": traces,
+        "vp_locations": vp_locations,
+    }
     return Result(
         data=data, warnings=warnings, provenance_extra={"vp_count_used": len(vps), "run_id": run_id}
     )
@@ -1972,8 +1989,8 @@ def lookup_ip(ip: str) -> Result:
     return Result(data=out, warnings=notes, provenance_extra={"sources": source_versions()})
 
 
-def _annotate_hop(hop: dict) -> dict:
-    """Add asn / geo to one traceroute hop, in place-ish (returns a new dict)."""
+def _annotate_hop(hop: dict, vp_loc: dict | None = None) -> dict:
+    """Add ASN and geo data, optionally checking the geo claim against RTT."""
     ip = hop.get("ip")
     enriched = dict(hop)
     if not ip:
@@ -2009,6 +2026,24 @@ def _annotate_hop(hop: dict) -> dict:
             registry = None
         if registry:
             geo = {**registry, "method": "rir-delegated", "confidence": "country-only"}
+    if geo and vp_loc:
+        coords = None
+        if geo.get("lat") is not None and geo.get("lng") is not None:
+            coords = (geo["lat"], geo["lng"])
+        elif geo.get("city"):
+            coords = city_coordinates(geo["city"], geo.get("country"))
+        if coords:
+            check = rtt_consistency(
+                vp_loc.get("lat"),
+                vp_loc.get("lon"),
+                coords[0],
+                coords[1],
+                hop.get("rtt_ms"),
+            )
+            if check:
+                geo["rtt_check"] = check
+                if not check["consistent"]:
+                    geo["confidence"] = "contradicted-by-rtt"
     enriched["geo"] = geo
     return enriched
 
@@ -2042,8 +2077,10 @@ def enrich_result(result_id: str) -> Result:
     hops = ips = 0
 
     if isinstance(data, dict) and isinstance(data.get("traces"), list):
+        vp_locations = data.get("vp_locations") or {}
         for trace in data["traces"]:
-            trace["hops"] = [_annotate_hop(h) for h in trace.get("hops", [])]
+            vp_loc = vp_locations.get(trace.get("vp_id"))
+            trace["hops"] = [_annotate_hop(hop, vp_loc) for hop in trace.get("hops", [])]
             hops += len(trace["hops"])
     elif isinstance(data, list):
         for rec in data:

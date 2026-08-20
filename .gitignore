@@ -20,3 +20,6 @@ db_credentials.env
 datasets/
 outputs/
 *.json.tmp
+
+# Optional local upstream checkout used for migration/synchronization.
+/arc-automate/
