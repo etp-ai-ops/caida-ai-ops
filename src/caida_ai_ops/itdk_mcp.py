@@ -48,8 +48,15 @@ def main() -> None:
     immediately and visibly, instead of connecting successfully and erroring on
     every tool call.
     """
-    configure_itdk_runtime(Settings.from_env())
-    mcp.run()
+    # configure_itdk_runtime builds the pool but does not open it -- the HTTP
+    # service opens it from a Starlette lifespan handler. stdio has no lifespan,
+    # so open it here, or every tool call fails with PoolClosed.
+    pool = configure_itdk_runtime(Settings.from_env())
+    pool.open()
+    try:
+        mcp.run()
+    finally:
+        pool.close()
 
 
 if __name__ == "__main__":
