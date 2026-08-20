@@ -829,6 +829,36 @@ def _live_measure(
     return out
 
 
+def _resolve_vps(vp_filter: dict | None, fn_name: str) -> list[dict]:
+    """Resolve a vp_filter to VP dicts, surfacing discovery failures properly.
+
+    `list_vps` returns an envelope, so a failed lookup yields ``data: None``.
+    Indexing straight into it turns a clear "no VPs matched that filter" into
+    an opaque TypeError several frames later, which is what a caller then has
+    to debug. Re-raise the real error instead.
+    """
+    resp = list_vps(**(vp_filter or {}))
+    if resp["status"] != "ok" or resp["data"] is None:
+        err = resp.get("error") or {}
+        raise NoMatchingVPsError(
+            f"{fn_name}: could not resolve vantage points from vp_filter="
+            f"{vp_filter!r}: {err.get('message', 'unknown error')}"
+        )
+    return resp["data"]
+
+
+def _measured(records: list) -> list[dict]:
+    """Per-VP records that actually carry a measurement.
+
+    `_live_measure` emits a record for every VP it was asked about, and a VP
+    that errored or never replied carries an ``error`` key instead of the
+    measurement fields. Callers that aggregate across VPs must skip those
+    rather than assume every record is complete -- a missing field here is a
+    normal outcome, not a bug.
+    """
+    return [r for r in records if isinstance(r, dict) and "error" not in r]
+
+
 def _parse_ping(obj: Any) -> dict:
     sent = obj.probe_count or 0
     recv = obj.nreplies or 0
@@ -966,7 +996,7 @@ def ping(
         )
     _require_range(timeout_ms, MIN_PING_TIMEOUT_MS, MAX_PING_TIMEOUT_MS, "timeout_ms")
 
-    vps = list_vps(**(vp_filter or {}))["data"]
+    vps = _resolve_vps(vp_filter, "ping")
     _enforce_vp_fanout_limit(vps, "ping")
     probe_count = count if count is not None else max(int((duration_s or 10.0) * 1000 / interval_ms), 1)
     if len(vps) * probe_count > MAX_TOTAL_PING_PROBES:
@@ -1023,8 +1053,17 @@ def is_reachable(target: str, vp_filter: dict | None = None, timeout_ms: int = 2
         "reachable": bool}]}``.
     """
     raw = ping(target, vp_filter=vp_filter, count=1, timeout_ms=timeout_ms)
-    per_vp = [{"vp_id": r["vp_id"], "reachable": r["received"] > 0} for r in raw["data"]]
-    pct = round(100.0 * sum(1 for p in per_vp if p["reachable"]) / len(per_vp), 1) if per_vp else 0.0
+    # A VP that could not be measured is reported as reachable: None rather
+    # than folded into the percentage, which would understate reachability.
+    per_vp = [{"vp_id": r["vp_id"],
+               "reachable": None if "error" in r else r["received"] > 0,
+               **({"error": r["error"]} if "error" in r else {})}
+              for r in raw["data"]]
+    # Percentage is over VPs that produced a measurement: a VP that errored is
+    # evidence of nothing, and counting it as unreachable would report a
+    # measurement failure as a network finding.
+    testable = [p for p in per_vp if p["reachable"] is not None]
+    pct = round(100.0 * sum(1 for p in testable if p["reachable"]) / len(testable), 1) if testable else 0.0
     return Result(data={"pct_reachable": pct, "per_vp": per_vp}, warnings=raw["warnings"])
 
 
@@ -1082,8 +1121,15 @@ def compare_ping_regions(target: str, region_a: str, region_b: str, **ping_kwarg
     """
     ra = ping(target, vp_filter={"region": region_a}, **ping_kwargs)
     rb = ping(target, vp_filter={"region": region_b}, **ping_kwargs)
-    avg_a = round(statistics.mean(r["rtt_avg_ms"] for r in ra["data"]), 2)
-    avg_b = round(statistics.mean(r["rtt_avg_ms"] for r in rb["data"]), 2)
+    rtts_a = [r["rtt_avg_ms"] for r in _measured(ra["data"]) if r.get("rtt_avg_ms") is not None]
+    rtts_b = [r["rtt_avg_ms"] for r in _measured(rb["data"]) if r.get("rtt_avg_ms") is not None]
+    if not rtts_a or not rtts_b:
+        raise NoMatchingVPsError(
+            "no VP in one of the two regions returned an RTT, so the regions "
+            "cannot be compared"
+        )
+    avg_a = round(statistics.mean(rtts_a), 2)
+    avg_b = round(statistics.mean(rtts_b), 2)
     data = {
         "region_a": {"region": region_a, "avg_rtt_ms": avg_a, "vp_count": len(ra["data"])},
         "region_b": {"region": region_b, "avg_rtt_ms": avg_b, "vp_count": len(rb["data"])},
@@ -1181,7 +1227,7 @@ def traceroute(
     _require_range(attempts_per_hop, 1, MAX_TRACEROUTE_ATTEMPTS_PER_HOP, "attempts_per_hop")
     _require_range(wait_ms, MIN_TRACEROUTE_WAIT_MS, MAX_TRACEROUTE_WAIT_MS, "wait_ms")
 
-    vps = list_vps(**(vp_filter or {}))["data"]
+    vps = _resolve_vps(vp_filter, "traceroute")
     _enforce_vp_fanout_limit(vps, "traceroute")
 
     warnings = _demo_warning() if is_demo_mode() else []
@@ -1509,7 +1555,7 @@ def dns_query(
     if qtype not in _SUPPORTED_QTYPES:
         raise UnsupportedQtypeError(f"unsupported DNS record type: {qtype!r}")
     _require_range(timeout_ms, MIN_DNS_TIMEOUT_MS, MAX_DNS_TIMEOUT_MS, "timeout_ms")
-    vps = list_vps(**(vp_filter or {}))["data"]
+    vps = _resolve_vps(vp_filter, "dns_query")
     _enforce_vp_fanout_limit(vps, "dns_query")
     if is_demo_mode():
         results = [_demo_dns_one(vp, qname, qtype) for vp in vps]
@@ -1555,7 +1601,7 @@ def dns_divergence_report(
     raw = dns_query(qname, qtype=qtype, vp_filter=vp_filter, resolver=resolver)
     groups: dict[tuple, list[str]] = {}
     for r in raw["data"]:
-        key = tuple(sorted(r["answers"]))
+        key = tuple(sorted(r.get("answers") or []))
         groups.setdefault(key, []).append(r["vp_id"])
     ordered = sorted(groups.items(), key=lambda kv: -len(kv[1]))
     majority_key, majority_vps = ordered[0] if ordered else ((), [])
@@ -1591,7 +1637,7 @@ def check_dnssec_valid(qname: str, vp_filter: dict | None = None) -> Result:
     dnskey_by_vp = {r["vp_id"]: r for r in dnskey["data"]}
     out = []
     for r in ds["data"]:
-        has_ds = bool(r["answers"])
+        has_ds = bool(r.get("answers"))
         dk = dnskey_by_vp.get(r["vp_id"], {"answers": []})
         has_dnskey = bool(dk["answers"])
         out.append(
