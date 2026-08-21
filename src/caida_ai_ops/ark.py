@@ -353,6 +353,7 @@ def _check_mux_access(mux_path: Path) -> None:
         gid = mux_path.stat().st_gid
         try:
             import grp
+
             group = grp.getgrgid(gid).gr_name
         except (KeyError, ImportError):
             group = "ark-mux"
@@ -362,7 +363,7 @@ def _check_mux_access(mux_path: Path) -> None:
             f"and this process (uid {os.getuid()}, groups {sorted(os.getgroups())}) is not "
             f"in it. On a host: have an administrator add your user to {group!r} (CAIDA "
             f"access requires signing the Computer Facilities Usage Agreement). In a "
-            f"container: pass the host's numeric gid, e.g. group_add: [\"{gid}\"] -- GIDs "
+            f'container: pass the host\'s numeric gid, e.g. group_add: ["{gid}"] -- GIDs '
             f"are numeric across the container boundary and are assigned per host, so read "
             f"it with `getent group {group}` on the host rather than assuming a value."
         )
@@ -1112,10 +1113,14 @@ def is_reachable(target: str, vp_filter: dict | None = None, timeout_ms: int = 2
     raw = ping(target, vp_filter=vp_filter, count=1, timeout_ms=timeout_ms)
     # A VP that could not be measured is reported as reachable: None rather
     # than folded into the percentage, which would understate reachability.
-    per_vp = [{"vp_id": r["vp_id"],
-               "reachable": None if "error" in r else r["received"] > 0,
-               **({"error": r["error"]} if "error" in r else {})}
-              for r in raw["data"]]
+    per_vp = [
+        {
+            "vp_id": r["vp_id"],
+            "reachable": None if "error" in r else r["received"] > 0,
+            **({"error": r["error"]} if "error" in r else {}),
+        }
+        for r in raw["data"]
+    ]
     # Percentage is over VPs that produced a measurement: a VP that errored is
     # evidence of nothing, and counting it as unreachable would report a
     # measurement failure as a network finding.
@@ -1182,8 +1187,7 @@ def compare_ping_regions(target: str, region_a: str, region_b: str, **ping_kwarg
     rtts_b = [r["rtt_avg_ms"] for r in _measured(rb["data"]) if r.get("rtt_avg_ms") is not None]
     if not rtts_a or not rtts_b:
         raise NoMatchingVPsError(
-            "no VP in one of the two regions returned an RTT, so the regions "
-            "cannot be compared"
+            "no VP in one of the two regions returned an RTT, so the regions cannot be compared"
         )
     avg_a = round(statistics.mean(rtts_a), 2)
     avg_b = round(statistics.mean(rtts_b), 2)
